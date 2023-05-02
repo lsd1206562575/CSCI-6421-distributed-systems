@@ -7,7 +7,6 @@ import (
 	"log"
 	"math"
 	"net"
-	"net/http"
 	"os"
 	"path"
 	"strconv"
@@ -19,21 +18,21 @@ import (
 type MultipartUploadInfo struct {
 	FileHash   string
 	FileName   string
-	FileSize   int
+	FileSize   int64
 	UploadID   string
 	ChunkSize  int
 	ChunkCount int
 }
 
-func InitialMultipartUploadHandler(w http.ResponseWriter, r *http.Request) {
+func InitialMultipartUploadHandler(filehash string, filename string, filesize int64) {
 	//解析用户请求参数
-	r.ParseForm()
-	filehash := r.Form.Get("filehash")
-	filename := r.Form.Get("filename")
-	filesize, err := strconv.Atoi(r.Form.Get("filesize"))
-	if err != nil {
-		return
-	}
+	//r.ParseForm()
+	//filehash := r.Form.Get("filehash")
+	//filename := r.Form.Get("filename")
+	//filesize, err := strconv.Atoi(r.Form.Get("filesize"))
+	//if err != nil {
+	//	return
+	//}
 
 	//获得redis连接
 	rConn := rPool.RedisPool().Get()
@@ -66,7 +65,7 @@ func InitialMultipartUploadHandler(w http.ResponseWriter, r *http.Request) {
 
 	// 读取并切分文件
 	buffer := make([]byte, chunkSize)
-	for i := 0; ; i++ {
+	for i := 0; i < upinfo.ChunkCount; i++ {
 		// 读取文件块
 		n, err := file.Read(buffer)
 		if err != nil && err != io.EOF {
@@ -77,66 +76,64 @@ func InitialMultipartUploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 
 		// 创建切分文件
-		chunkFileName := fmt.Sprintf(upinfo.UploadID+"%d", i)
-		chunkFile, err := os.Create(chunkFileName)
+		chunkFileName := fmt.Sprintf(upinfo.FileName+"%d", i)
+		chunkFilePath := "/tmp/"
+		chunkFile, err := os.Create(chunkFilePath + chunkFileName)
 		if err != nil {
 			log.Fatal(err)
 		}
 		defer chunkFile.Close()
+	}
+	//从配置文件中读取dataNode ip列表，将文件的分块按顺序分发到节点，更新redis数据
+	for i := 0; i < upinfo.ChunkCount; i++ {
+		IPAddress := utils.ReadFromUtil()
+		tmpChunk := "/tmp/" + upinfo.FileName + strconv.Itoa(i)
+		chunkName, err := os.Open(tmpChunk)
+		if err != nil {
+			log.Fatal(err)
+		}
+		for j := 0; j < 3; j++ {
+			count := 0
+			for k := j; k < len(IPAddress); k++ {
+				conn, err := net.Dial("tcp", IPAddress[k]+":22")
+				if err != nil {
+					log.Fatal(err)
+				}
+				defer conn.Close()
+				// 块分发
+				fpath := "/data/" + upinfo.UploadID + "chkidx_" + strconv.Itoa(i) + "replica_" + strconv.Itoa(j)
+				os.MkdirAll(path.Dir(fpath), 0777)
+				fd, err := os.Create(fpath)
+				if err != nil {
+					return
+				}
+				defer fd.Close()
 
-		//从配置文件中读取dataNode ip列表，将文件的分块按顺序分发到节点，更新redis数据
-		for i := 0; i < upinfo.ChunkCount; i++ {
-			IPAddress := utils.ReadFromUtil()
-			tmpChunk := "/tmp/" + upinfo.UploadID + strconv.Itoa(i)
-			chunkName, err := os.Open(tmpChunk)
-			if err != nil {
-				log.Fatal(err)
-			}
-			for j := 0; j < 3; j++ {
-				for k := j; k < len(IPAddress); k++ {
-					conn, err := net.Dial("tcp", IPAddress[k])
+				buf := make([]byte, 1024*1024)
+				for {
+					// 读取文件块
+					n, err := chunkName.Read(buf)
+					if err != nil && err != io.EOF {
+						log.Fatal(err)
+					}
+
+					// 发送文件块到服务器
+					_, err = conn.Write(buffer[:n])
 					if err != nil {
 						log.Fatal(err)
 					}
-					defer conn.Close()
-					// 块分发
-					fpath := "/data/" + upinfo.UploadID + "chkidx_" + strconv.Itoa(i) + "replica_" + strconv.Itoa(j)
-					os.MkdirAll(path.Dir(fpath), 0777)
-					fd, err := os.Create(fpath)
-					if err != nil {
-						w.WriteHeader(401)
-						return
-					}
-					defer fd.Close()
+				}
+				rConn.Do("HSET", "MP_"+upinfo.UploadID, "chkidx_"+strconv.Itoa(i)+"replica_"+strconv.Itoa(j), IPAddress[k])
 
-					buf := make([]byte, 1024*1024)
-					for {
-						// 读取文件块
-						n, err := chunkName.Read(buf)
-						if err != nil && err != io.EOF {
-							log.Fatal(err)
-						}
-						if n == 0 {
-							break
-						}
-						// 发送文件块到服务器
-						_, err = conn.Write(buffer[:n])
-						if err != nil {
-							log.Fatal(err)
-						}
-					}
-					rConn.Do("HSET", "MP_"+upinfo.UploadID, "chkidx_"+strconv.Itoa(i)+"replica_"+strconv.Itoa(j), IPAddress[k])
-					if k == j-1 {
-						k = 0
-					}
+				count++
+				if k == j-1 && count < len(IPAddress) {
+					k = 0
 				}
 			}
 		}
-
-		//响应初始化数据返回客户端
-		io.WriteString(w, "Success")
-
 	}
+
+	//响应初始化数据返回客户端
 }
 
 // 上传文件分块

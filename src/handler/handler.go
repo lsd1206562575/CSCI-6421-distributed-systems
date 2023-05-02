@@ -52,6 +52,8 @@ func UploadHandler(w http.ResponseWriter, r *http.Request) {
 		fileMeta.FileSha1 = utils.FileSha1(newFile)
 		meta.UpdateFileMeta(fileMeta)
 
+		InitialMultipartUploadHandler(fileMeta.FileSha1, fileMeta.FileName, fileMeta.FileSize)
+
 		http.Redirect(w, r, "upload/suc", http.StatusFound)
 	}
 }
